@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -40,21 +41,14 @@ def compute_ashp_heat_kwh(
     ashp_p: ashp_model.ASHPParams,
     dt_h: float = 0.5,
 ) -> np.ndarray:
-    """Compute ASHP delivered heat [kWh], capped by fitted capacity map.
-
-    Heat inferred from ``P * COP`` can exceed the identified capacity map,
-    especially during cold/high-sink conditions, which causes unrealistically
-    large injections and hot-node spikes in long rollouts.  This helper keeps
-    ASHP heat physically bounded while preserving COP dependence.
-    """
+    """Compute ASHP delivered heat [kWh] from measured power and fitted COP."""
     P = np.asarray(P_meas_kwh, dtype=float)
     T_a = np.asarray(T_out, dtype=float)
     T_s = np.asarray(T_sink, dtype=float)
 
-    cop = ashp_model.predict_cop(T_a, T_s, ashp_p)
-    q_from_cop = P * cop
-    q_cap = ashp_model.predict_capacity(T_a, T_s, ashp_p) * dt_h
-    return np.clip(np.minimum(q_from_cop, q_cap), 0.0, None)
+    cop_fit = ashp_model.predict_cop(T_a, T_s, ashp_p)
+    q_fit = P * cop_fit
+    return np.clip(q_fit, 0.0, None)
 
 
 def back_calculate_ashp_heat(
@@ -109,8 +103,7 @@ def back_calculate_ashp_heat(
 
     if n_ashp_only < 50:
         logger.warning(
-            "Insufficient ASHP-only intervals (%d < 50) for back-calculation; "
-            "fallback to a = b * 3.0 retained.",
+            "Insufficient ASHP-only intervals (%d < 50) for heuristic back-calculation.",
             n_ashp_only,
         )
         return Q_back
@@ -218,11 +211,15 @@ def back_calculate_ashp_heat_energy_balance(
 
     if "ashp_inst_kwh" in df.columns:
         p_meas = df["ashp_inst_kwh"].fillna(0).to_numpy(dtype=float)
-        valid = np.isfinite(q_labels) & (p_meas > ashp_on_threshold_kwh)
-        if valid.any():
+
+        cop_floor = 1.8
+        cop_ceiling = 5.0
+
+        mask = np.isfinite(q_labels) & (p_meas > 0.05)
+        if mask.any():
             q_min = cop_floor * p_meas
             q_max = cop_ceiling * p_meas
-            q_labels[valid] = np.clip(q_labels[valid], q_min[valid], q_max[valid])
+            q_labels[mask] = np.clip(q_labels[mask], q_min[mask], q_max[mask])
 
     out = pd.Series(q_labels, index=df.index, name="Q_ashp_backcalc_kwh")
     if out.notna().sum() < min_valid:
@@ -260,9 +257,24 @@ def back_calculate_ashp_heat_hybrid(
     only_h = np.isfinite(q_h) & ~np.isfinite(q_e)
     only_e = ~np.isfinite(q_h) & np.isfinite(q_e)
 
-    q_mix[both] = (1.0 - weight) * q_h[both] + weight * q_e[both]
+    q_mix[both] = np.maximum(q_h[both], q_e[both])
     q_mix[only_h] = q_h[only_h]
     q_mix[only_e] = q_e[only_e]
+
+    # Temporary debug export for ASHP label magnitudes/distributions.
+    if "ashp_inst_kwh" in df.columns:
+        ashp_on = df["ashp_inst_kwh"].fillna(0).to_numpy(dtype=float) > 0.05
+        debug_labels = pd.DataFrame(
+            {
+                "q_h": q_h,
+                "q_e": q_e,
+                "q_mix": q_mix,
+            },
+            index=df.index,
+        ).loc[ashp_on]
+        debug_path = Path("output") / "debug_labels_fast.csv"
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        debug_labels.to_csv(debug_path, index_label="timestamp")
 
     return pd.Series(np.clip(q_mix, 0.0, None), index=df.index, name="Q_ashp_backcalc_kwh")
 
@@ -809,34 +821,93 @@ def run_identification(
 
     logger.info("Train: %d rows, Val: %d rows", len(df_train), len(df_val))
 
-    # Step 1 (Pass 1): Fit ASHP power (b) coefficients only
+    # Step 1: Construct ASHP heat targets from back-calculated labels.
     T_sink_train = ashp_model.sink_proxy(
         df_train["tank_bottom_c"].values,
         df_train["tank_mid_c"].values,
     )
-    ashp_p = ashp_model.fit_ashp_maps(
-        T_out=df_train["t_out_c"].values,
-        T_sink=T_sink_train,
-        Q_meas_kwh=None,
-        P_meas_kwh=df_train["ashp_inst_kwh"].values,
+    q_energy = back_calculate_ashp_heat_energy_balance(df_train)
+    q_heur = back_calculate_ashp_heat(df_train)
+    # Build blended COP/capacity label base: q_mix combines energy-balance and heuristic labels.
+    q_mix = q_energy.copy()
+    both_mask = q_mix.notna() & q_heur.notna()
+    q_mix.loc[both_mask] = np.maximum(q_mix.loc[both_mask], q_heur.loc[both_mask])
+    heur_only_mask = q_mix.isna() & q_heur.notna()
+    q_mix.loc[heur_only_mask] = q_heur.loc[heur_only_mask]
+
+    # Capacity-map target series: use broad blended labels (Q_back) for Q_meas_kwh.
+    Q_back = q_mix.copy()
+
+    # Tighten ASHP label rows for COP fitting to cleaner charging intervals.
+    p_meas = df_train["ashp_inst_kwh"].fillna(0)
+    ashp_on = p_meas > 0.10
+    imm_off = df_train["imm_tot_inst_kwh"].fillna(0) < 0.01
+    st_low = (
+        df_train["st_kwh"].fillna(0) < 0.05
+        if "st_kwh" in df_train.columns
+        else pd.Series(True, index=df_train.index)
     )
 
-    # Step 1 (Pass 2): Back-calculate heat delivery and re-fit both a and b
-    Q_back = back_calculate_ashp_heat_hybrid(df_train, energy_weight=0.3)
+    # Prefer low draw intervals when a draw/volume column is available.
+    draw_col = next(
+        (c for c in ["draw_off_l", "draw_l", "draw_volume_l", "vol_draw_l"] if c in df_train.columns),
+        None,
+    )
+    if draw_col is not None:
+        draw_low = df_train[draw_col].fillna(0) < 5.0
+    else:
+        draw_low = pd.Series(True, index=df_train.index)
+
+    d_top = df_train["tank_top_c"].diff()
+    d_mid_hi = df_train["tank_mid_hi_c"].diff()
+    charging = (d_top > 0.05) | (d_mid_hi > 0.05)
+
+    # Exclude intervals where the top node is already very hot.
+    not_too_hot = df_train["tank_top_c"].fillna(100) < 55
+
+    # Prefer moderate/high ASHP-load intervals when enough data exists.
+    load_pref = pd.Series(True, index=df_train.index)
+    if int(ashp_on.sum()) > 50:
+        p60 = float(np.percentile(p_meas[ashp_on], 60))
+        load_pref = p_meas >= p60
+
+    clean_mask = ashp_on & imm_off & st_low & draw_low & charging & not_too_hot & load_pref
+    # COP-map target series: start from q_mix (q_mix_cop) and apply clean filtering only here.
+    q_mix_cop = q_mix.copy()
+    n_clean = int(clean_mask.sum())
+    if n_clean >= 20:
+        # Keep capacity labels untouched; blank only COP-target rows that fail clean_mask.
+        q_mix_cop.loc[~clean_mask] = np.nan
+    else:
+        logger.warning(
+            "Clean COP-fit filtering retained only %d rows (< 20); keeping unfiltered COP-target labels.",
+            n_clean,
+        )
+
+    debug_labels = pd.DataFrame(
+        {
+            "q_h": q_heur.to_numpy(dtype=float),
+            "q_e": q_energy.to_numpy(dtype=float),
+            "q_mix": q_mix.to_numpy(dtype=float),
+        },
+        index=df_train.index,
+    )
+    debug_path = Path("output") / "debug_labels_fast.csv"
+    debug_path.parent.mkdir(parents=True, exist_ok=True)
+    debug_labels.to_csv(debug_path, index_label="timestamp")
+
     df_train["Q_ashp_backcalc_kwh"] = Q_back
     df_val["Q_ashp_backcalc_kwh"] = np.nan
 
-    if Q_back.notna().sum() >= 50:
-        ashp_p = ashp_model.fit_ashp_maps(
-            T_out=df_train["t_out_c"].values,
-            T_sink=T_sink_train,
-            Q_meas_kwh=Q_back.values,
-            P_meas_kwh=df_train["ashp_inst_kwh"].values,
-        )
-        logger.info("ASHP capacity fitted from back-calculated heat data.")
-    else:
-        logger.warning("Insufficient ASHP-only intervals for back-calculation; "
-                       "fallback to a = b * 3.0 retained.")
+    ashp_p = ashp_model.fit_ashp_maps(
+        T_out=df_train["t_out_c"].values,
+        T_sink=T_sink_train,
+        Q_meas_kwh=Q_back.values,
+        P_meas_kwh=df_train["ashp_inst_kwh"].values,
+        # Capacity fit uses Q_back; COP fit uses q_mix_cop via Q_cop_meas_kwh.
+        Q_cop_meas_kwh=q_mix_cop.values,
+    )
+    logger.info("ASHP maps fitted using back-calculated heat labels where available.")
 
     # Step 2: Fit tank on training data unless we are iterating on ASHP labels
     # and want a cheap run that reuses a fixed tank parameter set.

@@ -60,6 +60,7 @@ def _resolve_fit_profile(fit_profile: str, max_nfev: int) -> dict:
             "max_nfev": min(max_nfev, 40),
             "default_n_weeks": 2,
             "default_sample_blocks": 4,
+            "default_train_frac": None,
             "fit_tank": True,
             "tank_fit_kwargs": {
                 "rollout_weight": 0.05,
@@ -67,7 +68,148 @@ def _resolve_fit_profile(fit_profile: str, max_nfev: int) -> dict:
                 "rollout_stride": 336,
             },
         }
+    if profile == "fast_ashp":
+        return {
+            "fit_profile": profile,
+            "max_nfev": min(max_nfev, 20),
+            "default_n_weeks": 12,
+            "default_sample_blocks": None,
+            "default_train_frac": 0.5,
+            "fit_tank": False,
+            "tank_fit_kwargs": {},
+        }
     raise ValueError(f"Unknown fit_profile={fit_profile!r}")
+
+
+def _load_tank_params_if_available(path: Path) -> tank_model.TankParams | None:
+    if not path.exists():
+        return None
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+        tank = payload.get("tank", {})
+        return tank_model.TankParams(
+            UA_loss=np.asarray(tank["UA_loss"], dtype=float),
+            UA_adj=np.asarray(tank["UA_adj"], dtype=float),
+            f_st=np.asarray(tank["f_st"], dtype=float),
+            f_ashp=np.asarray(tank["f_ashp"], dtype=float),
+            f_imm=np.asarray(tank["f_imm"], dtype=float),
+            mix_coeff=float(tank["mix_coeff"]),
+            alpha_draw=float(tank["alpha_draw"]),
+            T_mains=float(tank["T_mains"]),
+        )
+    except Exception as exc:
+        logger.warning("Failed loading tank params from %s: %s", path, exc)
+        return None
+
+
+def _safe_float(x: float | np.floating | None) -> float:
+    if x is None or not np.isfinite(x):
+        return float("nan")
+    return float(x)
+
+
+def _split_summary(
+    df_split: pd.DataFrame,
+    id_result: identification.IdentificationResult,
+    label: str,
+    split_inputs: dict | None = None,
+    T_pred: np.ndarray | None = None,
+) -> dict:
+    tank_cols = ["tank_bottom_c", "tank_mid_c", "tank_mid_hi_c", "tank_top_c"]
+    T_meas = df_split[tank_cols].to_numpy(dtype=float)
+
+    if split_inputs is None:
+        split_inputs = identification.prepare_inputs(df_split, id_result.ashp_params)
+    if T_pred is None:
+        T_cl = identification.simulate_closed_loop(
+            T_meas[0],
+            split_inputs["Q_st"],
+            split_inputs["Q_imm"],
+            split_inputs["T_amb"],
+            split_inputs["V_draw"],
+            split_inputs["T_cold"],
+            split_inputs["T_out"],
+            split_inputs["P_meas"],
+            id_result.ashp_params,
+            id_result.tank_params,
+        )
+        T_pred = T_cl[1:]
+    T_obs = T_meas[1:]
+    n = min(len(T_obs), len(T_pred))
+    T_obs = T_obs[:n]
+    T_pred = T_pred[:n]
+
+    node_rmse = {
+        "T_bottom": _safe_float(np.sqrt(np.nanmean((T_pred[:, 0] - T_obs[:, 0]) ** 2))),
+        "T_mid": _safe_float(np.sqrt(np.nanmean((T_pred[:, 1] - T_obs[:, 1]) ** 2))),
+        "T_mid_hi": _safe_float(np.sqrt(np.nanmean((T_pred[:, 2] - T_obs[:, 2]) ** 2))),
+        "T_top": _safe_float(np.sqrt(np.nanmean((T_pred[:, 3] - T_obs[:, 3]) ** 2))),
+    }
+
+    T_sink = ashp_model.sink_proxy(
+        df_split["tank_bottom_c"].to_numpy(dtype=float),
+        df_split["tank_mid_c"].to_numpy(dtype=float),
+    )
+    t_out = df_split["t_out_c"].to_numpy(dtype=float)
+    p_meas = df_split["ashp_inst_kwh"].fillna(0).to_numpy(dtype=float)
+    q_fit_kwh = ashp_model.predict_capacity(t_out, T_sink, id_result.ashp_params) * 0.5
+    cop_fit = ashp_model.predict_cop(t_out, T_sink, id_result.ashp_params)
+
+    q_back = (
+        df_split["Q_ashp_backcalc_kwh"].to_numpy(dtype=float)
+        if "Q_ashp_backcalc_kwh" in df_split.columns
+        else np.full(len(df_split), np.nan, dtype=float)
+    )
+
+    cop_mask = np.isfinite(q_back) & (p_meas > 0.05) & np.isfinite(cop_fit)
+    if np.any(cop_mask):
+        cop_true = q_back[cop_mask] / np.maximum(p_meas[cop_mask], 1e-9)
+        ape = 100.0 * np.abs(cop_fit[cop_mask] - cop_true) / np.maximum(np.abs(cop_true), 1e-9)
+        cop_errors = {
+            "median_ape": _safe_float(np.nanmedian(ape)),
+            "mean_ape": _safe_float(np.nanmean(ape)),
+            "rmse": _safe_float(np.sqrt(np.nanmean((cop_fit[cop_mask] - cop_true) ** 2))),
+            "n_samples": int(cop_mask.sum()),
+        }
+    else:
+        cop_errors = {
+            "median_ape": float("nan"),
+            "mean_ape": float("nan"),
+            "rmse": float("nan"),
+            "n_samples": 0,
+        }
+
+    on_mask = np.isfinite(p_meas) & (p_meas > 0.05) & np.isfinite(cop_fit)
+    if np.any(on_mask):
+        p_on = p_meas[on_mask]
+        q_on = q_fit_kwh[on_mask]
+        ashp_kpis = {
+            "spf": _safe_float(np.sum(q_on) / max(np.sum(p_on), 1e-9)),
+            "mean_cop_on": _safe_float(np.nanmean(cop_fit[on_mask])),
+            "frac_cop_above_3": _safe_float(np.mean(cop_fit[on_mask] > 3.0)),
+            "ashp_runtime_frac": _safe_float(np.mean(p_meas > 0.05)),
+        }
+    else:
+        ashp_kpis = {
+            "spf": float("nan"),
+            "mean_cop_on": float("nan"),
+            "frac_cop_above_3": float("nan"),
+            "ashp_runtime_frac": float("nan"),
+        }
+
+    eb_mask = np.isfinite(q_back) & np.isfinite(q_fit_kwh)
+    energy_resid = _safe_float(np.nansum(q_fit_kwh[eb_mask] - q_back[eb_mask])) if np.any(eb_mask) else float("nan")
+
+    return {
+        "label": label,
+        "node_rmse": node_rmse,
+        "cop_errors": cop_errors,
+        "ashp_kpis": ashp_kpis,
+        "ordering_rate": _safe_float(data_loader.node_ordering_check(df_split).mean()),
+        "energy_balance_residual_kwh": energy_resid,
+        "n_samples": int(len(df_split)),
+    }
 
 
 def main(
@@ -92,6 +234,8 @@ def main(
 
     profile = _resolve_fit_profile(fit_profile, max_nfev)
     max_nfev = profile["max_nfev"]
+    if profile.get("default_train_frac") is not None:
+        train_frac = profile["default_train_frac"]
     if n_weeks is None:
         n_weeks = profile["default_n_weeks"]
     if sample_blocks is None:
@@ -104,6 +248,8 @@ def main(
         n_weeks,
         sample_blocks,
     )
+    if profile["fit_profile"] == "fast_ashp":
+        logger.info("fast_ashp seasonal subset selection via --start-week=%d", start_week)
 
     tank_cols = ["tank_bottom_c", "tank_mid_c", "tank_mid_hi_c", "tank_top_c"]
     df = df.dropna(subset=tank_cols, how="all")
@@ -150,12 +296,23 @@ def main(
     logger.info("Node ordering satisfied: %.1f %%", ordering.mean() * 100)
 
     logger.info("Running identification (train_frac=%.2f) …", train_frac)
+    fixed_tank_params = None
+    summary_fast_path = output_dir / "summary_fast_ashp.json"
+    if profile["fit_profile"] == "fast_ashp":
+        params_file = output_dir / "params.json"
+        fixed_tank_params = _load_tank_params_if_available(params_file)
+        if fixed_tank_params is not None:
+            logger.info("Loaded existing tank params from %s for fast_ashp profile.", params_file)
+        else:
+            logger.info("No existing tank params found at %s; using default tank params.", params_file)
+
     id_result, df_train, df_val = identification.run_identification(
         df,
         train_frac=train_frac,
         max_nfev=max_nfev,
         fit_tank=profile["fit_tank"],
         tank_fit_kwargs=profile["tank_fit_kwargs"],
+        fixed_tank_params=fixed_tank_params,
     )
 
     params_file = output_dir / "params.json"
@@ -249,6 +406,28 @@ def main(
     export_df.to_csv(out_csv, index=False)
     logger.info("Saved ASHP heat timeseries CSV to %s", out_csv)
 
+    if profile["fit_profile"] == "fast_ashp":
+        train_inputs = identification.prepare_inputs(df_train, id_result.ashp_params)
+        T_train_cl = identification.simulate_closed_loop(
+            train_inputs["T_meas"][0],
+            train_inputs["Q_st"],
+            train_inputs["Q_imm"],
+            train_inputs["T_amb"],
+            train_inputs["V_draw"],
+            train_inputs["T_cold"],
+            train_inputs["T_out"],
+            train_inputs["P_meas"],
+            id_result.ashp_params,
+            id_result.tank_params,
+        )
+        summary_fast = {
+            "train": _split_summary(df_train, id_result, "train", split_inputs=train_inputs, T_pred=T_train_cl[1:]),
+            "val": _split_summary(df_val, id_result, "validation", split_inputs=val_inputs, T_pred=T_cl[1:]),
+        }
+        with open(summary_fast_path, "w") as f:
+            json.dump(summary_fast, f, indent=2)
+        logger.info("Saved fast ASHP summary to %s", summary_fast_path)
+
     return {"status": "identification completed"}
 
 
@@ -267,6 +446,7 @@ def _save_params(id_result: identification.IdentificationResult, path: Path) -> 
         "ashp": {
             "a": id_result.ashp_params.a.tolist(),
             "b": id_result.ashp_params.b.tolist(),
+            "c": id_result.ashp_params.c.tolist(),
         },
         "hx_effectiveness": id_result.hx_effectiveness,
     }
@@ -284,14 +464,16 @@ if __name__ == "__main__":
     parser.add_argument("--weeks", type=int, default=None,
                         help="Number of contiguous weeks to fit on (combine with --start-week).")
     parser.add_argument("--start-week", type=int, default=0,
-                        help="Week offset into the dataset (0=Dec 2023). Use to pick a season.")
+                        help="Week offset into the dataset (0=Dec 2023). Use to pick a season; "
+                            "for fast_ashp comparisons, run with e.g. --start-week 0, 12, or 24.")
     parser.add_argument("--sample-blocks", type=int, default=None,
                         help="Pick N evenly-spaced blocks of --weeks weeks across the full dataset "
                              "for seasonal coverage. E.g. --sample-blocks 4 --weeks 3 = 4×3 week "
                              "blocks (winter/spring/summer/autumn).")
-    parser.add_argument("--fit-profile", choices=["full", "fast", "fast-refit"], default="full",
+    parser.add_argument("--fit-profile", choices=["full", "fast", "fast-refit", "fast_ashp"], default="full",
                         help="Run profile. 'fast' is for quick ASHP-label iteration and skips tank re-fit; "
-                             "'fast-refit' keeps a cheap tank fit on sampled seasonal blocks.")
+                             "'fast-refit' keeps a cheap tank fit on sampled seasonal blocks; "
+                             "'fast_ashp' runs ASHP-only experiments on a small subset with fixed tank params.")
     args = parser.parse_args()
     main(args.csv, args.yaml, args.output, args.train_frac, args.max_nfev,
          args.weeks, args.start_week, args.sample_blocks, args.fit_profile)

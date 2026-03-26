@@ -37,9 +37,28 @@ class ASHPParams:
 
     Capacity  Q̇_cond = a0 + a1·T_out + a2·T_sink + a3·T_out·T_sink
     Power     P_elec = b0 + b1·T_out + b2·T_sink + b3·T_out·T_sink
+    COP       COP    = c0 + c1·T_out + c2·T_sink + c3·T_out·T_sink + c4·T_out^2 + c5·T_sink^2
     """
     a: np.ndarray = field(default_factory=lambda: np.array([8.0, 0.1, -0.05, 0.0]))
     b: np.ndarray = field(default_factory=lambda: np.array([3.0, -0.02, 0.03, 0.0]))
+    c: np.ndarray = field(default_factory=lambda: np.array([3.0, 0.02, -0.02, 0.0, 0.0, 0.0]))
+
+    def to_dict(self) -> dict[str, list[float]]:
+        """Serialize map coefficients for persistence."""
+        return {
+            "a": np.asarray(self.a, dtype=float).tolist(),
+            "b": np.asarray(self.b, dtype=float).tolist(),
+            "c": np.asarray(self.c, dtype=float).tolist(),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "ASHPParams":
+        """Deserialize coefficients; accept legacy payloads without COP map."""
+        base = cls()
+        a = np.asarray(payload.get("a", base.a), dtype=float)
+        b = np.asarray(payload.get("b", base.b), dtype=float)
+        c = np.asarray(payload.get("c", base.c), dtype=float)
+        return cls(a=a, b=b, c=c)
 
 
 def sink_proxy(
@@ -67,10 +86,14 @@ def predict_power(T_out: np.ndarray, T_sink: np.ndarray, p: ASHPParams) -> np.nd
 
 
 def predict_cop(T_out: np.ndarray, T_sink: np.ndarray, p: ASHPParams) -> np.ndarray:
-    """Return COP = Q̇_cond / P_elec."""
-    q = predict_capacity(T_out, T_sink, p)
-    pel = predict_power(T_out, T_sink, p)
-    return q / pel
+    """Predict COP from a direct fitted map."""
+    c = p.c
+    T_a, T_s = np.asarray(T_out, dtype=float), np.asarray(T_sink, dtype=float)
+    return np.clip(
+        c[0] + c[1] * T_a + c[2] * T_s + c[3] * T_a * T_s + c[4] * (T_a ** 2) + c[5] * (T_s ** 2),
+        1.0,
+        8.0,
+    )
 
 
 def fit_ashp_maps(
@@ -78,18 +101,19 @@ def fit_ashp_maps(
     T_sink: np.ndarray,
     Q_meas_kwh: np.ndarray,
     P_meas_kwh: np.ndarray,
+    Q_cop_meas_kwh: np.ndarray | None = None,
     dt_h: float = 0.5,
 ) -> ASHPParams:
-    """Fit ASHP capacity and power maps from measured interval energies.
+    """Fit ASHP capacity/power maps and a direct COP map from measured interval energies.
     Stage 1: Data Filtering
     Stage 2: Power Map Fitting
-    Stage 3: Capacity Map Fitting
+    Stage 3: COP Map Fitting
 
     Parameters
     ----------
     T_out, T_sink : outdoor air temperature and sink-proxy arrays [°C].
     Q_meas_kwh : measured condenser heat per interval [kWh] (may be unknown;
-                 pass NaN to skip capacity fitting – power only).
+                 pass NaN to skip COP fitting – power only).
     P_meas_kwh : measured ASHP electrical energy per interval [kWh].
     dt_h : interval length in hours (default 0.5).
 
@@ -146,8 +170,6 @@ def fit_ashp_maps(
     Q_meas = np.asarray(Q_meas_kwh, dtype=float) if Q_meas_kwh is not None else np.full_like(P_meas, np.nan)
     mask_q = mask & np.isfinite(Q_meas) & (Q_meas > 0.01)
 
-    # If direct heat output measurements (Q_meas_kwh) are available and there are enough valid points (>20),
-    # the a coefficients are fitted directly from data — the preferred approach.
     if mask_q.sum() > 20:
         T_a_q, T_s_q = T_a[mask_q], T_s[mask_q]
         Q_kw = Q_meas[mask_q] / dt_h
@@ -163,11 +185,73 @@ def fit_ashp_maps(
         res_a = least_squares(cap_residuals, a_init, loss="soft_l1")
         params.a = res_a.x
         logger.info("ASHP capacity map coefficients: %s", params.a)
-    # Otherwise they're estimated from an assumed average COP
     else:
-        # Estimate capacity from power × assumed COP
-        avg_cop = 3.0
-        params.a = params.b * avg_cop
-        logger.info("ASHP capacity estimated from power × COP=%.1f", avg_cop)
+        logger.warning(
+            "Insufficient valid ASHP heat labels for capacity fitting (%d <= 20); "
+            "skipping capacity fit.",
+            mask_q.sum(),
+        )
+
+    # Direct COP fit from provided COP labels (defaults to Q_meas) and measured electrical input.
+    # Capacity (a) and power (b) fitting above are unchanged; weighting is applied only in this COP fit.
+    Q_cop_meas = (
+        np.asarray(Q_cop_meas_kwh, dtype=float)
+        if Q_cop_meas_kwh is not None
+        else Q_meas
+    )
+    mask_cop = (
+        np.isfinite(Q_cop_meas)
+        & (Q_cop_meas > 0.01)
+        & np.isfinite(P_meas)
+        & (P_meas > 0.05)
+        & np.isfinite(T_a)
+        & np.isfinite(T_s)
+    )
+
+    if mask_cop.sum() > 20:
+        T_a_c, T_s_c = T_a[mask_cop], T_s[mask_cop]
+        COP_meas = Q_cop_meas[mask_cop] / P_meas[mask_cop]
+        # Clip COP targets before fitting to stabilise training against extreme label noise.
+        COP_meas = np.clip(COP_meas, 1.0, 4.0)
+
+        # Upweight higher-COP (lower-lift, warmer) operation so the COP map better tracks that regime.
+        # Construct weights from measured COP, clipped to [1, 4] to limit leverage of extreme points.
+        weights = np.clip(COP_meas, 1.0, 4.0)
+        # Use soft power weighting (1.3) to emphasize warmer/high-COP regimes without over-sharpening.
+        weights = (weights ** 1.3) / np.mean(weights ** 1.3)
+
+        Xc = np.column_stack([
+            np.ones(len(T_a_c)),
+            T_a_c,
+            T_s_c,
+            T_a_c * T_s_c,
+            T_a_c ** 2,
+            T_s_c ** 2,
+        ])
+        c_init = np.array([3.0, 0.02, -0.02, 0.0, 0.0, 0.0])
+
+        def cop_residuals(c):
+            pred = Xc @ c
+            pred = np.clip(pred, 1.0, 8.0)
+            # Weighted residuals plus light L2 regularisation improve warm-period fit while keeping coefficients stable.
+            residuals = weights * (pred - COP_meas)
+
+            lambda_reg = 0.01
+            residuals = np.concatenate([
+                residuals,
+                np.sqrt(lambda_reg) * c
+            ])
+            return residuals
+
+        logger.info("No. of valid data points used for COP fitting: %d", mask_cop.sum())
+        res_c = least_squares(cop_residuals, c_init, loss="soft_l1")
+        params.c = res_c.x
+        logger.info("ASHP COP map coefficients: %s", params.c)
+    else:
+        logger.warning(
+            "Insufficient valid ASHP rows for COP fitting (%d <= 20); "
+            "skipping COP fit.",
+            mask_cop.sum(),
+        )
 
     return params
