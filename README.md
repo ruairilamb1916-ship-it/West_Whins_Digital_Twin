@@ -1,57 +1,111 @@
-# Stage‑1 – Data & Mapping 
+# DHW Digital Twin Stage 1
 
-This repository builds a **Stage‑1 digital twin** for a DHW system:
-- 14 kW ATW heat pump; 550 L DHW tank with **four** nodes (bottom, mid, mid‑hi, top); 100 L buffer;
-- Solar‑thermal array charging the DHW tank;
-- Two 64 kW immersion heaters (backup/legionella).
+This repository fits a Stage 1 digital twin for a domestic hot water system with a stratified tank and an ASHP performance model. The main goal is to identify tank behaviour and ASHP maps from historical half-hourly data, then inspect how the fitted COP map compares with label-based COP targets.
+# West Whins Digital Twin – ASHP COP Calibration
 
-**Stage‑1 uses solar‑thermal as measured** (from `ST Power [kW]` or derived from ST flow and ΔT); no forecasting or MPC yet.
+## Overview
+This project calibrates an Air Source Heat Pump (ASHP) model using measured data.
 
-## Input dataset
+Recent work focused on improving COP (Coefficient of Performance) estimation:
+- Separate capacity and COP labels
+- Clean filtering of COP training data
+- Weighted COP regression to better match real operation
 
-Provide a single **30‑minute** time‑series CSV with columns (or mappable equivalents):
-- `Time`
-- `Tank Bottom [°C]`, `Tank Mid [°C]`, `Tank Mid Hi [°C]`, `Tank Top [°C]`
-- `ST Flow [L]`, `ST Flow T [°C]`, `ST Ret T [°C]`, `ST Power [kW]`
-- `ASHP Elec [kWh]`, `ASHP Inst [kWh]`
-- `Imm Tot Inst [kWh]` (and possibly `Imm Tot [kWh]`, `Backup Imm Elec [kWh]`)
-- `PV Inst [kW]` (kept for completeness in Stage‑1)
-- **`T_amb [C]`** (plant‑room ambient; used for tank losses and ASHP mapping)
+---
 
-These headers and cadence are consistent with the working dataset. Use `column_mapping.yaml` to map if they differ. 
+## Key Results
 
-## Data
-Place the following files in the data/ directory before running:
-- FullDS_Findhorn.csv (30-minute dataset)
-- Data_WestWhins_2023_2024_1min.csv (1-minute energy data, 2023-2024)
-- Data_WestWhins_2025_final_1min.csv (1-minute energy data, 2025)
-- Data_WestWhins_TankT__with_T_out_1min.csv (1-minute tank temperatures + T_out)
+| Season | COP_fit | COP_target |
+|-------|--------|-----------|
+| Winter (w0) | ~1.80 | ~1.92 |
+| Spring (w12) | ~2.19 | ~2.31 |
+| Summer (w24) | ~2.35 | ~2.23 |
 
-## Known quirks to handle
+→ Model now tracks seasonal COP behaviour much better.
 
-- **Small negative `PV Inst [kW]`** values can occur at night; treat as expected artefacts.   
-- Occasional **`#N/A` tokens** appear; parse as missing without breaking the pipeline.   
-- **Cumulative meters** (e.g., `ASHP Elec [kWh]`) must be differenced to interval kWh with rollover repair.   
-- If `ST Power [kW]` is missing, derive ST heat from flow × ΔT × ρ × cp × η_HX (η_HX identified). 
+---
 
-## Ambient usage
+## Improvements Made
 
-| Column | Meaning | Used for |
-|---|---|---|
-| `t_amb_c` | Plant-room temperature proxy (≈ outdoor air + 10 °C) | Tank UA heat-loss calculations |
-| `t_out_c` | Estimated outdoor air temperature (`t_amb_c − 10.0`, derived by the loader) | ASHP performance mapping (capacity, power, COP) |
+- Introduced `q_mix` (blended heat label)
+- Separated COP vs capacity training signals
+- Added COP filtering logic
+- Added soft weighting (power = 1.3)
+- Stabilised regression with clipping + regularisation
 
-`t_out_c` is added automatically by the data loader whenever `t_amb_c` is present.
+---
 
-## Minimal expectations from the loader
+## Diagnostics
 
-- Parse `Time` (`%d/%m/%Y %H:%M`) and align to 30‑min grid.
-- Standardise units and names via the mapping.
-- Create interval energies, repair rollovers, and flag QC repairs.
-- Clip impossible temperatures and log a QC message.
-- Check node ordering (T_top ≥ T_mh ≥ T_mid ≥ T_bottom) for diagnostics.
+### COP Fit vs Target
+![COP comparison](output/plots/cop_comparison.png)
 
-## Out of scope in Stage‑1
+---
 
-- No forecasting (wind or ST) and no MPC.
-- No pasteurisation scheduling (immersion energy still included in the balance).
+## How to Run
+
+```bash
+python3 run_stage1.py --fit-profile fast_ashp
+python3 scripts/debug_ashp_map.py
+
+## Model structure
+
+- Tank model: 4-node DHW tank with standing loss, mixing, draws, immersion, and solar thermal input.
+- ASHP maps: separate fitted maps for electrical power, delivered heat capacity, and direct COP as functions of outdoor temperature and sink temperature.
+
+## Run stage 1
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Run the main identification pipeline:
+
+```bash
+python3 run_stage1.py --fit-profile fast_ashp --start-week 0 --weeks 12
+```
+
+Useful seasonal comparisons:
+
+```bash
+python3 run_stage1.py --fit-profile fast_ashp --start-week 12 --weeks 12
+python3 run_stage1.py --fit-profile fast_ashp --start-week 24 --weeks 12
+```
+
+## Run ASHP map debugging
+
+After stage 1 has produced `output/params.json` and `output/debug_labels_fast.csv`, run:
+
+```bash
+python3 scripts/debug_ashp_map.py --start-week 0 --weeks 12
+```
+
+This writes `output/debug_ashp_map.csv` for the same seasonal subset used in `run_stage1.py`.
+
+## soft_weighted_cop_v1 baseline
+
+The current baseline uses:
+
+- `Q_back` as the broad capacity-fit target
+- `q_mix` / `q_mix_cop` as the COP-fit target
+- clean COP filtering applied only to the COP target series
+- clipped COP targets before regression
+- soft COP sample weighting with a 1.3 power to give warmer, higher-COP points more influence
+- light L2 regularisation to stabilise the COP coefficients
+
+This setup is intended to improve warm-period COP fit without making the quadratic COP map unstable.
+
+## Key outputs
+
+- `output/params.json`: fitted tank and ASHP parameters
+- `output/summary.json` or `output/summary_fast_ashp.json`: summary metrics including validation RMSE
+- `output/debug_labels_fast.csv`: blended ASHP heat labels used for debugging
+- `output/debug_ashp_map.csv`: per-timestep comparison of `COP_fit`, `COP_target`, and fitted heat/power
+
+The main diagnostics to compare are:
+
+- `COP_fit` vs `COP_target`
+- validation RMSE reported by `run_stage1.py`
+- mean `COP_fit` and mean `COP_target` reported by `debug_ashp_map.py`
