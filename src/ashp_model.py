@@ -90,7 +90,7 @@ def predict_cop(T_out: np.ndarray, T_sink: np.ndarray, p: ASHPParams) -> np.ndar
     c = p.c
     T_a, T_s = np.asarray(T_out, dtype=float), np.asarray(T_sink, dtype=float)
     return np.clip(
-        c[0] + c[1] * T_a + c[2] * T_s + c[3] * T_a * T_s + c[4] * (T_a ** 2) + c[5] * (T_s ** 2),
+        c[0] + c[1] * T_a + c[2] * T_s + c[3] * (T_a ** 2) + c[4] * (T_s ** 2) + c[5] * T_a * T_s,
         1.0,
         8.0,
     )
@@ -217,16 +217,16 @@ def fit_ashp_maps(
         # Upweight higher-COP (lower-lift, warmer) operation so the COP map better tracks that regime.
         # Construct weights from measured COP, clipped to [1, 4] to limit leverage of extreme points.
         weights = np.clip(COP_meas, 1.0, 4.0)
-        # Use soft power weighting (1.3) to emphasize warmer/high-COP regimes without over-sharpening.
-        weights = (weights ** 1.3) / np.mean(weights ** 1.3)
+        # Use stronger power weighting to emphasize warmer/high-COP regimes.
+        weights = (weights ** 1.5) / np.mean(weights ** 1.5)
 
         Xc = np.column_stack([
             np.ones(len(T_a_c)),
             T_a_c,
             T_s_c,
-            T_a_c * T_s_c,
             T_a_c ** 2,
             T_s_c ** 2,
+            T_a_c * T_s_c,
         ])
         c_init = np.array([3.0, 0.02, -0.02, 0.0, 0.0, 0.0])
 
@@ -236,7 +236,7 @@ def fit_ashp_maps(
             # Weighted residuals plus light L2 regularisation improve warm-period fit while keeping coefficients stable.
             residuals = weights * (pred - COP_meas)
 
-            lambda_reg = 0.01
+            lambda_reg = 0.001
             residuals = np.concatenate([
                 residuals,
                 np.sqrt(lambda_reg) * c
@@ -245,8 +245,15 @@ def fit_ashp_maps(
 
         logger.info("No. of valid data points used for COP fitting: %d", mask_cop.sum())
         res_c = least_squares(cop_residuals, c_init, loss="soft_l1")
-        params.c = res_c.x
+        c = res_c.x
+        params.c = c
         logger.info("ASHP COP map coefficients: %s", params.c)
+        print(
+            "Fitted COP coefficients: "
+            f"c0={c[0]:.6f}, c1={c[1]:.6f}, c2={c[2]:.6f}, "
+            f"c3={c[3]:.6f}, c4={c[4]:.6f}, c5={c[5]:.6f}"
+        )
+        print("COP coeffs:", c)
     else:
         logger.warning(
             "Insufficient valid ASHP rows for COP fitting (%d <= 20); "

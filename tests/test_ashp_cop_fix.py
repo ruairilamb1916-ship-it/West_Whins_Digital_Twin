@@ -197,6 +197,42 @@ class TestBackCalculateFallback:
 
 @pytest.mark.skipif(not CSV_PATH.exists(), reason="Full dataset not available")
 class TestCOPNotConstant:
+    def test_synthetic_cop_fit_preserves_temperature_dependence(self, capsys):
+        """Direct COP fit should learn non-flat outdoor-temperature dependence."""
+        t_out_vals = np.linspace(-5.0, 15.0, 12)
+        t_sink_vals = np.linspace(30.0, 50.0, 9)
+        t_out_grid, t_sink_grid = np.meshgrid(t_out_vals, t_sink_vals, indexing="ij")
+        t_out = t_out_grid.ravel()
+        t_sink = t_sink_grid.ravel()
+        p_meas = np.full_like(t_out, 2.0)
+        cop_true = (
+            2.8
+            + 0.06 * t_out
+            - 0.015 * t_sink
+            + 0.0012 * (t_out ** 2)
+            - 0.0004 * (t_sink ** 2)
+            + 0.0008 * t_out * t_sink
+        )
+        q_meas = cop_true * p_meas
+
+        params = ashp_model.fit_ashp_maps(
+            T_out=t_out,
+            T_sink=t_sink,
+            Q_meas_kwh=q_meas,
+            P_meas_kwh=p_meas,
+            Q_cop_meas_kwh=q_meas,
+            dt_h=0.5,
+        )
+
+        cop_pred = ashp_model.predict_cop(t_out, t_sink, params)
+        cold_cop = ashp_model.predict_cop(np.array([-5.0]), np.array([40.0]), params)[0]
+        warm_cop = ashp_model.predict_cop(np.array([15.0]), np.array([40.0]), params)[0]
+        captured = capsys.readouterr()
+
+        assert warm_cop > cold_cop
+        assert cop_pred.std() > 0.1
+        assert "COP coeffs:" in captured.out
+
     def test_cop_varies_with_conditions(self):
         """After back-calculation fix, predicted COP should vary."""
         from src.data_loader import load_and_clean
