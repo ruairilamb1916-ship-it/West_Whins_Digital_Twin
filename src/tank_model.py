@@ -26,6 +26,45 @@ CP  = 4.186     # kJ/(kg·K)
 NODE_VOL_L = 550.0 / 4.0   # litres per node
 NODE_MASS = NODE_VOL_L * RHO / 1000.0   # kg  (137.5 kg)
 NODE_CAP  = NODE_MASS * CP  # kJ/K  (≈575.3)
+DHW_EXTRACTION_FRACTIONS = np.array([0.0, 0.05, 0.25, 0.70], dtype=float)
+
+
+def _soft_enforce_stratification_row(T_row: np.ndarray) -> np.ndarray:
+    """Apply minimal local averaging to enforce bottom<=mid<=mid_hi<=top.
+
+    This is a numerically stable post-step correction that removes node inversions
+    without introducing abrupt global mixing.
+    """
+    x = np.asarray(T_row, dtype=float).copy()
+    # A few forward sweeps are sufficient for 4 nodes.
+    for _ in range(6):
+        changed = False
+        if x[0] > x[1]:
+            m = 0.5 * (x[0] + x[1])
+            x[0] = m
+            x[1] = m
+            changed = True
+        if x[1] > x[2]:
+            m = 0.5 * (x[1] + x[2])
+            x[1] = m
+            x[2] = m
+            changed = True
+        if x[2] > x[3]:
+            m = 0.5 * (x[2] + x[3])
+            x[2] = m
+            x[3] = m
+            changed = True
+        if not changed:
+            break
+    return x
+
+
+def _soft_enforce_stratification_batch(T_mat: np.ndarray) -> np.ndarray:
+    """Vector helper for row-wise stratification enforcement."""
+    T_out = np.asarray(T_mat, dtype=float).copy()
+    for n in range(T_out.shape[0]):
+        T_out[n] = _soft_enforce_stratification_row(T_out[n])
+    return T_out
 
 
 def _st_acceptance_factor(T_hot: float) -> float:
@@ -159,6 +198,7 @@ def tank_step_batch(
     T_cold: np.ndarray | float,
     params: "TankParams",
     dt_s: float = 1800.0,
+    Q_dhw_kwh: np.ndarray | None = None,
 ) -> np.ndarray:
     """Vectorised tank step for N *independent* steps (one-step-ahead use only).
 
@@ -182,6 +222,10 @@ def tank_step_batch(
     Q_st   = np.asarray(Q_st_kwh,   dtype=float) * 3600.0  # (N,) kJ
     Q_ashp = np.asarray(Q_ashp_kwh, dtype=float) * 3600.0
     Q_imm  = np.asarray(Q_imm_kwh,  dtype=float) * 3600.0
+    if Q_dhw_kwh is None:
+        Q_dhw = np.zeros(len(T), dtype=float)
+    else:
+        Q_dhw = np.asarray(Q_dhw_kwh, dtype=float) * 3600.0
 
     # Use hottest upper-layer node (mid, mid-hi, top) as acceptance proxy.
     T_hot = np.max(T[:, 1:], axis=1)
@@ -223,6 +267,9 @@ def tank_step_batch(
 
     T_temp2 = T_temp + (-loss + cond + mix) / NODE_CAP
 
+    # Step 2b: explicit DHW heat extraction, applied preferentially to upper nodes.
+    T_temp2 = T_temp2 - (Q_dhw[:, None] * DHW_EXTRACTION_FRACTIONS[None, :]) / NODE_CAP
+
     # Step 3: draw-off displacement (cold water in at bottom, hot out at top)
     T_cold_arr = np.asarray(T_cold, dtype=float)
     if T_cold_arr.ndim == 0:
@@ -236,7 +283,9 @@ def tank_step_batch(
         T_new[:, i] = (1 - f) * T_temp2[:, i] + f * T_temp2[:, i - 1]
     T_new[:, 0] = (1 - f) * T_temp2[:, 0] + f * T_cold_arr
 
-    return np.clip(T_new, 5.0, 95.0)
+    T_new = np.clip(T_new, 5.0, 95.0)
+    T_new = _soft_enforce_stratification_batch(T_new)
+    return T_new
 
 
 def tank_step(
@@ -249,6 +298,7 @@ def tank_step(
     T_cold: float,
     params: TankParams,
     dt_s: float = 1800.0,
+    Q_dhw_kwh: float = 0.0,
 ) -> np.ndarray:
     """Advance the 4-node tank by one time step (Euler forward).
 
@@ -272,6 +322,7 @@ def tank_step(
     Q_st_kj  = Q_st_kwh * 3600.0
     Q_ashp_kj = Q_ashp_kwh * 3600.0
     Q_imm_kj  = Q_imm_kwh * 3600.0
+    Q_dhw_kj = Q_dhw_kwh * 3600.0
 
     # Limit effective input when upper layers are already hot.
     T_hot = float(np.max(T[1:]))
@@ -317,6 +368,9 @@ def tank_step(
         dT_loss = (-loss + cond + mix) / NODE_CAP
         T_temp2[i] = T_temp[i] + dT_loss
 
+    for i in range(4):
+        T_temp2[i] -= (Q_dhw_kj * DHW_EXTRACTION_FRACTIONS[i]) / NODE_CAP
+
     # 3. Apply draw-off displacement
     f = params.alpha_draw * V_draw_l / NODE_VOL_L
     f = np.clip(f, 0.0, 1.0)
@@ -326,8 +380,9 @@ def tank_step(
         T_new[i] = (1 - f) * T_temp2[i] + f * T_temp2[i - 1]
     T_new[0] = (1 - f) * T_temp2[0] + f * T_cold
 
-    # Enforce plausible bounds
+    # Enforce plausible bounds and remove any node inversions.
     T_new = np.clip(T_new, 5.0, 95.0)
+    T_new = _soft_enforce_stratification_row(T_new)
     return T_new
 
 
@@ -341,6 +396,7 @@ def tank_step_with_breakdown(
     T_cold: float,
     params: TankParams,
     dt_s: float = 1800.0,
+    Q_dhw_kwh: float = 0.0,
 ) -> tuple[np.ndarray, dict]:
     """Advance one step and return detailed per-node energy breakdown.
 
@@ -352,6 +408,7 @@ def tank_step_with_breakdown(
     Q_st_kj = Q_st_kwh * 3600.0
     Q_ashp_kj = Q_ashp_kwh * 3600.0
     Q_imm_kj = Q_imm_kwh * 3600.0
+    Q_dhw_kj = Q_dhw_kwh * 3600.0
 
     # Apply same acceptance limiter as tank_step for consistency.
     T_hot = float(np.max(T[1:]))
@@ -362,6 +419,7 @@ def tank_step_with_breakdown(
     loss_kj = np.zeros(4)
     cond_kj = np.zeros(4)
     mix_kj = np.zeros(4)
+    dhw_kj = np.zeros(4)
 
     f_st = _normalise_fractions(params.f_st)
     f_ashp = _normalise_fractions(params.f_ashp)
@@ -400,6 +458,9 @@ def tank_step_with_breakdown(
         mix_kj[i] = mix
         T_temp2[i] = T_temp[i] + (-loss + cond + mix) / NODE_CAP
 
+    dhw_kj = Q_dhw_kj * DHW_EXTRACTION_FRACTIONS
+    T_temp2 = T_temp2 - dhw_kj / NODE_CAP
+
     # 3) Draw displacement contribution (derived from node energy change)
     f = params.alpha_draw * V_draw_l / NODE_VOL_L
     f = np.clip(f, 0.0, 1.0)
@@ -410,9 +471,10 @@ def tank_step_with_breakdown(
 
     draw_kj = (T_new - T_temp2) * NODE_CAP
     T_new = np.clip(T_new, 5.0, 95.0)
+    T_new = _soft_enforce_stratification_row(T_new)
 
     total_kj = (T_new - T) * NODE_CAP
-    net_kj = heat_kj - loss_kj + cond_kj + mix_kj + draw_kj
+    net_kj = heat_kj - loss_kj + cond_kj + mix_kj - dhw_kj + draw_kj
 
     breakdown = {
         "T_prev": T.tolist(),
@@ -423,6 +485,7 @@ def tank_step_with_breakdown(
         "loss_kj": loss_kj.tolist(),
         "cond_kj": cond_kj.tolist(),
         "mix_kj": mix_kj.tolist(),
+        "dhw_kj": dhw_kj.tolist(),
         "draw_kj": draw_kj.tolist(),
         "net_kj": net_kj.tolist(),
         "total_kj_from_deltaT": total_kj.tolist(),
@@ -432,6 +495,7 @@ def tank_step_with_breakdown(
         "Q_st_kwh": float(Q_st_kwh),
         "Q_ashp_kwh": float(Q_ashp_kwh),
         "Q_imm_kwh": float(Q_imm_kwh),
+        "Q_dhw_kwh": float(Q_dhw_kwh),
     }
     return T_new, breakdown
 
@@ -446,6 +510,7 @@ def simulate(
     T_cold: np.ndarray,
     params: TankParams,
     dt_s: float = 1800.0,
+    Q_dhw: np.ndarray | None = None,
 ) -> np.ndarray:
     """Run the tank model over N time steps.
 
@@ -464,6 +529,8 @@ def simulate(
     T_hist : array (N+1, 4) — temperatures at each step (including T0).
     """
     N = len(Q_st)
+    if Q_dhw is None:
+        Q_dhw = np.zeros(N, dtype=float)
     T_hist = np.zeros((N + 1, 4))
     T_hist[0] = T0
 
@@ -479,5 +546,6 @@ def simulate(
             float(T_cold[k]),
             params,
             dt_s,
+            Q_dhw_kwh=float(Q_dhw[k]),
         )
     return T_hist

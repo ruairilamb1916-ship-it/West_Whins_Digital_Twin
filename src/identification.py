@@ -18,6 +18,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.optimize import least_squares
+from tqdm import tqdm
 
 from . import ashp_model, solar_thermal, tank_model
 from .tank_model import CP, NODE_CAP, NODE_VOL_L, RHO, TankParams
@@ -39,6 +40,8 @@ def compute_ashp_heat_kwh(
     T_out: np.ndarray | float,
     T_sink: np.ndarray | float,
     ashp_p: ashp_model.ASHPParams,
+    T_bottom: np.ndarray | float | None = None,
+    T_top: np.ndarray | float | None = None,
     dt_h: float = 0.5,
 ) -> np.ndarray:
     """Compute ASHP delivered heat [kWh] from measured power and fitted COP."""
@@ -46,8 +49,16 @@ def compute_ashp_heat_kwh(
     T_a = np.asarray(T_out, dtype=float)
     T_s = np.asarray(T_sink, dtype=float)
 
-    cop_fit = ashp_model.predict_cop(T_a, T_s, ashp_p)
+    T_eff = ashp_model.effective_sink_temperature(T_s, T_bottom=T_bottom, T_top=T_top)
+    cop_fit = ashp_model.predict_cop(T_a, T_eff, ashp_p)
     q_fit = P * cop_fit
+
+    p_fit_kwh = ashp_model.predict_power(T_a, T_eff, ashp_p) * dt_h
+    load_ratio = np.clip(P / np.maximum(p_fit_kwh, 1e-6), 0.25, 1.25)
+    part_load_factor = np.clip(0.85 + 0.15 * load_ratio, 0.7, 1.05)
+
+    q_cap_kwh = 1.15 * ashp_model.predict_capacity(T_a, T_eff, ashp_p) * dt_h
+    q_fit = np.minimum(q_fit * part_load_factor, q_cap_kwh)
     return np.clip(q_fit, 0.0, None)
 
 
@@ -417,7 +428,7 @@ def mains_temp_seasonal(
 def prepare_inputs(df: pd.DataFrame, ashp_p: ashp_model.ASHPParams, dt_h: float = 0.5) -> dict:
     """Build arrays needed for tank simulation from a cleaned DataFrame.
 
-    Returns dict with keys: T_meas (N,4), Q_st, Q_ashp, Q_imm, T_amb, V_draw, T_cold, T_out, P_meas (all N,).
+    Returns dict with keys: T_meas (N,4), Q_st, Q_ashp, Q_imm, Q_dhw, T_amb, V_draw, T_cold, T_out, P_meas (all N,).
     """
     T_meas = df[["tank_bottom_c", "tank_mid_c", "tank_mid_hi_c", "tank_top_c"]].values
 
@@ -432,30 +443,98 @@ def prepare_inputs(df: pd.DataFrame, ashp_p: ashp_model.ASHPParams, dt_h: float 
     T_sink = ashp_model.sink_proxy(df["tank_bottom_c"].values, df["tank_mid_c"].values)
     # Convert measured electrical input to delivered heat with map-based cap.
     P_meas = df["ashp_inst_kwh"].fillna(0).values
-    Q_ashp = compute_ashp_heat_kwh(P_meas, df["t_out_c"].values, T_sink, ashp_p, dt_h=dt_h)
+    Q_ashp = compute_ashp_heat_kwh(
+        P_meas,
+        df["t_out_c"].values,
+        T_sink,
+        ashp_p,
+        T_bottom=df["tank_bottom_c"].values,
+        T_top=df["tank_top_c"].values,
+        dt_h=dt_h,
+    )
 
     # Immersion
     Q_imm = df["imm_tot_inst_kwh"].fillna(0).values
+
+    synthetic_v_draw = None
+
+    def _limit_and_redistribute_v_draw(v_draw_l: np.ndarray) -> tuple[np.ndarray, int, float, float]:
+        """Limit abrupt per-step synthetic draw by carrying overflow forward.
+
+        This keeps the cumulative draw volume essentially unchanged while
+        preventing single-step displacement shocks that can collapse upper nodes.
+        """
+        v = np.asarray(v_draw_l, dtype=float).copy()
+        v = np.clip(v, 0.0, None)
+        if v.size == 0 or not np.any(v > 0):
+            return v, 0, 0.0, 0.0
+
+        # Keep per-step displacement modest: <= 10% of one node volume.
+        max_v_per_step_l = 0.10 * tank_model.NODE_VOL_L
+        max_before = float(np.max(v))
+        clips = 0
+
+        # Forward carry of excess volume preserves total volume while
+        # spreading intense draw timesteps over subsequent timesteps.
+        for k in range(len(v) - 1):
+            if v[k] > max_v_per_step_l:
+                excess = v[k] - max_v_per_step_l
+                v[k] = max_v_per_step_l
+                v[k + 1] += excess
+                clips += 1
+
+        # If overflow reaches the final step, cap it and preserve total approximately.
+        if v[-1] > max_v_per_step_l:
+            v[-1] = max_v_per_step_l
+            clips += 1
+
+        max_after = float(np.max(v))
+        return v, clips, max_before, max_after
+    if "dhw_draw_size_l" in df.columns:
+        synthetic_v_draw = pd.to_numeric(df["dhw_draw_size_l"], errors="coerce").fillna(0).values
+
+    if synthetic_v_draw is not None and float(np.nansum(synthetic_v_draw)) > 0:
+        original_total_l = float(np.nansum(synthetic_v_draw))
+        V_draw, n_clips, max_before, max_after = _limit_and_redistribute_v_draw(synthetic_v_draw)
+        limited_total_l = float(np.nansum(V_draw))
+        if limited_total_l > 0 and original_total_l > 0:
+            V_draw *= original_total_l / limited_total_l
+
+        Q_dhw = np.zeros(len(df), dtype=float)
+        logger.info(
+            "Using synthetic DHW draw volume via V_draw displacement (total %.2f L). "
+            "Max V_draw %.2f -> %.2f L/step, limiter applications=%d; explicit Q_dhw sink disabled.",
+            float(np.nansum(V_draw)),
+            max_before,
+            max_after,
+            n_clips,
+        )
+    else:
+        if "dhw_draw_energy_kwh" in df.columns:
+            Q_dhw = pd.to_numeric(df["dhw_draw_energy_kwh"], errors="coerce").fillna(0).values
+        else:
+            Q_dhw = np.zeros(len(df), dtype=float)
 
     T_amb = df["t_amb_c"].fillna(df["t_amb_c"].median()).values
 
     # Seasonal cold mains temperature — varies ~7–14 °C across the year.
     T_cold = mains_temp_seasonal(df.index)
 
-    # Infer draw-off from the full measured profile change after accounting for
-    # heating inputs and nominal passive tank dynamics.
-    V_draw = infer_draw_off_from_temps(
-        df,
-        Q_st=Q_st,
-        Q_ashp=Q_ashp,
-        Q_imm=Q_imm,
-        T_amb=T_amb,
-        min_fraction=0.02,
-        max_fraction=0.9,
-        min_improvement=0.25,
-        cold_in=T_cold,
-        nominal_params=TankParams(),
-    )
+    if synthetic_v_draw is None or float(np.nansum(synthetic_v_draw)) <= 0:
+        # Infer draw-off from the full measured profile change after accounting for
+        # heating inputs and nominal passive tank dynamics.
+        V_draw = infer_draw_off_from_temps(
+            df,
+            Q_st=Q_st,
+            Q_ashp=Q_ashp,
+            Q_imm=Q_imm,
+            T_amb=T_amb,
+            min_fraction=0.02,
+            max_fraction=0.9,
+            min_improvement=0.25,
+            cold_in=T_cold,
+            nominal_params=TankParams(),
+        )
 
     T_out = df["t_out_c"].values
 
@@ -464,6 +543,7 @@ def prepare_inputs(df: pd.DataFrame, ashp_p: ashp_model.ASHPParams, dt_h: float 
         Q_st=Q_st,
         Q_ashp=Q_ashp,
         Q_imm=Q_imm,
+        Q_dhw=Q_dhw,
         T_amb=T_amb,
         V_draw=V_draw,
         T_cold=T_cold,
@@ -500,6 +580,7 @@ def fit_tank_params(
     Q_st   = inputs["Q_st"]
     Q_ashp = inputs["Q_ashp"]
     Q_imm  = inputs["Q_imm"]
+    Q_dhw  = inputs.get("Q_dhw", np.zeros(len(Q_st)))
     T_amb  = inputs["T_amb"]
     V_draw = inputs["V_draw"]
     T_cold = inputs["T_cold"]
@@ -570,6 +651,7 @@ def fit_tank_params(
             Q_st[:steps], Q_ashp[:steps], Q_imm[:steps],
             T_amb[:steps], V_draw[:steps], T_cold_eff[:steps],
             p,
+            Q_dhw_kwh=Q_dhw[:steps],
         )
         err_1step = (T_pred - T_meas[1: steps + 1]).ravel()
 
@@ -607,6 +689,7 @@ def fit_tank_params(
                         float(V_draw[k]),
                         float(T_cold_eff[k]),
                         p,
+                        Q_dhw_kwh=float(Q_dhw[k]),
                     )
                     err_rollout_parts.append(T_roll - T_meas[k + 1])
 
@@ -657,20 +740,32 @@ def simulate_closed_loop(
     ashp_p: ashp_model.ASHPParams,
     params: tank_model.TankParams,
     dt_s: float = 1800.0,
+    Q_dhw: np.ndarray | None = None,
 ) -> np.ndarray:
     """Simulate the tank autonomously (closed-loop for ASHP as well).
 
     Uses predicted tank state to compute T_sink, then Q_ashp from ASHP map.
     """
     N = len(Q_st)
+    if Q_dhw is None:
+        Q_dhw = np.zeros(N, dtype=float)
     T_hist = np.zeros((N + 1, 4))
     T_hist[0] = T0
 
-    for k in range(N):
+    for k in tqdm(range(N), desc="Simulating tank", unit="step"):
         # Compute T_sink from current predicted state
         T_sink = ashp_model.sink_proxy(T_hist[k, 0], T_hist[k, 1])  # bottom and mid
         # Compute Q_ashp using predicted T_sink with a capacity cap.
-        Q_ashp_k = float(compute_ashp_heat_kwh(P_meas[k], T_out[k], T_sink, ashp_p))
+        Q_ashp_k = float(
+            compute_ashp_heat_kwh(
+                P_meas[k],
+                T_out[k],
+                T_sink,
+                ashp_p,
+                T_bottom=T_hist[k, 0],
+                T_top=T_hist[k, 3],
+            )
+        )
 
         T_hist[k + 1] = tank_model.tank_step(
             T_hist[k],
@@ -682,6 +777,7 @@ def simulate_closed_loop(
             float(T_cold[k]),
             params,
             dt_s,
+            Q_dhw_kwh=float(Q_dhw[k]),
         )
     return T_hist
 
@@ -699,17 +795,30 @@ def simulate_closed_loop_with_diagnostics(
     params: tank_model.TankParams,
     dt_s: float = 1800.0,
     report_steps: int = 24,
+    Q_dhw: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[dict]]:
     """Simulate closed-loop and record diagnostic terms for first report_steps."""
     N = len(Q_st)
+    if Q_dhw is None:
+        Q_dhw = np.zeros(N, dtype=float)
     T_hist = np.zeros((N + 1, 4))
     T_hist[0] = T0
     diagnostics = []
 
-    for k in range(N):
+    for k in tqdm(range(N), desc="Simulating tank", unit="step"):
         T_sink = ashp_model.sink_proxy(T_hist[k, 0], T_hist[k, 1])
-        cop = ashp_model.predict_cop(T_out[k], T_sink, ashp_p)
-        Q_ashp_k = float(compute_ashp_heat_kwh(P_meas[k], T_out[k], T_sink, ashp_p))
+        T_eff = ashp_model.effective_sink_temperature(T_sink, T_hist[k, 0], T_hist[k, 3])
+        cop = ashp_model.predict_cop(T_out[k], T_eff, ashp_p)
+        Q_ashp_k = float(
+            compute_ashp_heat_kwh(
+                P_meas[k],
+                T_out[k],
+                T_sink,
+                ashp_p,
+                T_bottom=T_hist[k, 0],
+                T_top=T_hist[k, 3],
+            )
+        )
 
         if k < report_steps:
             diagnostics.append({
@@ -720,6 +829,7 @@ def simulate_closed_loop_with_diagnostics(
                 "P_meas": float(P_meas[k]),
                 "COP": float(cop),
                 "Q_ashp": float(Q_ashp_k),
+                "Q_dhw": float(Q_dhw[k]),
             })
 
         T_hist[k + 1] = tank_model.tank_step(
@@ -732,6 +842,7 @@ def simulate_closed_loop_with_diagnostics(
             float(T_cold[k]),
             params,
             dt_s,
+            Q_dhw_kwh=float(Q_dhw[k]),
         )
 
     return T_hist, diagnostics
@@ -750,20 +861,33 @@ def simulate_closed_loop_with_energy_audit(
     params: tank_model.TankParams,
     dt_s: float = 1800.0,
     report_steps: int = 24,
+    Q_dhw: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[dict]]:
     """Simulate closed-loop and capture full tank energy-budget terms.
 
     Each audit row includes ASHP coupling terms and per-node tank terms in kJ.
     """
     N = len(Q_st)
+    if Q_dhw is None:
+        Q_dhw = np.zeros(N, dtype=float)
     T_hist = np.zeros((N + 1, 4))
     T_hist[0] = T0
     audits = []
 
-    for k in range(N):
+    for k in tqdm(range(N), desc="Simulating tank", unit="step"):
         T_sink = ashp_model.sink_proxy(T_hist[k, 0], T_hist[k, 1])
-        cop = ashp_model.predict_cop(T_out[k], T_sink, ashp_p)
-        Q_ashp_k = float(compute_ashp_heat_kwh(P_meas[k], T_out[k], T_sink, ashp_p))
+        T_eff = ashp_model.effective_sink_temperature(T_sink, T_hist[k, 0], T_hist[k, 3])
+        cop = ashp_model.predict_cop(T_out[k], T_eff, ashp_p)
+        Q_ashp_k = float(
+            compute_ashp_heat_kwh(
+                P_meas[k],
+                T_out[k],
+                T_sink,
+                ashp_p,
+                T_bottom=T_hist[k, 0],
+                T_top=T_hist[k, 3],
+            )
+        )
 
         T_next, breakdown = tank_model.tank_step_with_breakdown(
             T_hist[k],
@@ -775,6 +899,7 @@ def simulate_closed_loop_with_energy_audit(
             float(T_cold[k]),
             params,
             dt_s,
+            Q_dhw_kwh=float(Q_dhw[k]),
         )
         T_hist[k + 1] = T_next
 
@@ -786,6 +911,7 @@ def simulate_closed_loop_with_energy_audit(
                 "P_meas_kwh": float(P_meas[k]),
                 "COP": float(cop),
                 "Q_ashp_kwh": Q_ashp_k,
+                "Q_dhw_kwh": float(Q_dhw[k]),
             }
             row.update(breakdown)
             audits.append(row)

@@ -1,0 +1,12 @@
+metric,value
+stratification_validity_rate,0.1432067794536054
+outside_bounds_fraction_any_node,0.0
+annual_dhw_energy_kwh,1999.9999999999998
+n_events,439.0
+avg_bottom_drop_c,1.034308504933779
+median_bottom_drop_c,0.7239239955603907
+avg_top_drop_c,0.42095540764096984
+median_top_drop_c,0.18949481592656525
+avg_top_recovery_min,875.4669703872437
+median_top_recovery_min,60.0
+timestep_minutes,30.0
