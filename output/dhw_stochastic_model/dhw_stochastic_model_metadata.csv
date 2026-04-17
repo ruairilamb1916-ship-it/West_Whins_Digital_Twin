@@ -1,0 +1,8 @@
+attribute,value
+total_events,510
+date_min,2023-12-14 08:00:00
+date_max,2025-10-20 12:00:00
+months_with_events,12
+hours_with_events,24
+mean_events_per_day,0.75
+signal_type,ST Flow [L] with optional cooling proxy
