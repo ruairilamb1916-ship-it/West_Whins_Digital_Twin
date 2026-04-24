@@ -1,4 +1,16 @@
-# Byte-compiled / optimized / DLL files
+# Outputs
+output/
+output_*/
+
+# Plots
+*.png
+
+# CSV outputs (optional)
+*.csv
+
+# Python cache
+__pycache__/
+*.pyc# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
 *$py.class

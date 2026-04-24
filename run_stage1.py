@@ -26,6 +26,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent
+DEFAULT_DHW_PATH = ROOT / "output" / "dhw_stochastic_model" / "dhw_tank_input_2024_scaled_2000.csv"
+DHW_SMOOTHING_WINDOW = 3
 
 
 def _resolve_fit_profile(fit_profile: str, max_nfev: int) -> dict:
@@ -107,6 +109,95 @@ def _safe_float(x: float | np.floating | None) -> float:
     if x is None or not np.isfinite(x):
         return float("nan")
     return float(x)
+
+
+def _merge_dhw_profile(df: pd.DataFrame, dhw_path: Path | None) -> pd.DataFrame:
+    merged = df.copy()
+
+    if dhw_path is None:
+        dhw_path = DEFAULT_DHW_PATH
+    if not dhw_path.exists():
+        merged["dhw_draw_energy_kwh"] = 0.0
+        logger.info("No DHW profile found at %s; assuming zero DHW withdrawal.", dhw_path)
+        return merged
+
+    dhw_df = pd.read_csv(dhw_path)
+    if "timestamp" not in dhw_df.columns:
+        raise ValueError(f"Missing timestamp column in DHW profile: {dhw_path}")
+
+    dhw_df["timestamp"] = pd.to_datetime(dhw_df["timestamp"], errors="raise")
+    if "dhw_draw_size_l" not in dhw_df.columns:
+        dhw_df["dhw_draw_size_l"] = 0.0
+    if "dhw_draw_energy_kwh" not in dhw_df.columns:
+        dhw_df["dhw_draw_energy_kwh"] = 0.0
+    dhw_df["dhw_draw_size_l"] = pd.to_numeric(
+        dhw_df["dhw_draw_size_l"], errors="coerce"
+    ).fillna(0.0)
+    dhw_df["dhw_draw_energy_kwh"] = pd.to_numeric(
+        dhw_df["dhw_draw_energy_kwh"], errors="coerce"
+    ).fillna(0.0)
+
+    merged = (
+        merged.reset_index()
+        .merge(
+            dhw_df[["timestamp", "dhw_draw_size_l", "dhw_draw_energy_kwh"]],
+            left_on="time",
+            right_on="timestamp",
+            how="left",
+        )
+        .drop(columns=["timestamp"])
+        .set_index("time")
+        .sort_index()
+    )
+    if "dhw_draw_size_l" not in merged.columns:
+        merged["dhw_draw_size_l"] = 0.0
+    if "dhw_draw_energy_kwh" not in merged.columns:
+        merged["dhw_draw_energy_kwh"] = 0.0
+    matched_rows = int(merged["dhw_draw_energy_kwh"].notna().sum())
+    merged["dhw_draw_size_l"] = merged["dhw_draw_size_l"].fillna(0.0)
+    merged["dhw_draw_energy_kwh"] = merged["dhw_draw_energy_kwh"].fillna(0.0)
+
+    original_total_l = float(merged["dhw_draw_size_l"].sum())
+    original_total_dhw = float(merged["dhw_draw_energy_kwh"].sum())
+    if original_total_l > 0:
+        smoothed_l = (
+            merged["dhw_draw_size_l"]
+            .rolling(window=DHW_SMOOTHING_WINDOW, min_periods=1, center=True)
+            .mean()
+            .fillna(0.0)
+        )
+        smoothed_total_l = float(smoothed_l.sum())
+        if smoothed_total_l > 0:
+            smoothed_l *= original_total_l / smoothed_total_l
+        merged["dhw_draw_size_l"] = smoothed_l
+
+    if original_total_dhw > 0:
+        smoothed_kwh = (
+            merged["dhw_draw_energy_kwh"]
+            .rolling(window=DHW_SMOOTHING_WINDOW, min_periods=1, center=True)
+            .mean()
+            .fillna(0.0)
+        )
+        smoothed_total_dhw = float(smoothed_kwh.sum())
+        if smoothed_total_dhw > 0:
+            smoothed_kwh *= original_total_dhw / smoothed_total_dhw
+        merged["dhw_draw_energy_kwh"] = smoothed_kwh
+
+    logger.info(
+        "Merged DHW profile from %s: matched %d/%d rows, DHW energy %.2f -> %.2f kWh after %d-step smoothing.",
+        dhw_path,
+        matched_rows,
+        len(merged),
+        original_total_dhw,
+        float(merged["dhw_draw_energy_kwh"].sum()),
+        DHW_SMOOTHING_WINDOW,
+    )
+    logger.info(
+        "Synthetic DHW volume %.2f -> %.2f L after smoothing; withdrawal will be applied via tank draw displacement.",
+        original_total_l,
+        float(merged["dhw_draw_size_l"].sum()),
+    )
+    return merged
 
 
 def _split_summary(
@@ -216,6 +307,7 @@ def main(
     csv_path: Path | None = None,
     yaml_path: Path | None = None,
     output_dir: Path | None = None,
+    dhw_path: Path | None = None,
     train_frac: float = 0.7,
     max_nfev: int = 300,
     n_weeks: int | None = None,
@@ -223,13 +315,14 @@ def main(
     sample_blocks: int | None = None,
     fit_profile: str = "full",
 ) -> dict:
-    csv_path = csv_path or ROOT / "data" / "FullDS_Findhorn.csv"
+    csv_path = csv_path or ROOT / "data" / "FullDS_Findhorn_clean.csv"
     yaml_path = yaml_path or ROOT / "column_mapping.yaml"
     output_dir = output_dir or ROOT / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("Loading data from %s", csv_path)
     df = data_loader.load_and_clean(csv_path, yaml_path)
+    df = _merge_dhw_profile(df, dhw_path)
     logger.info("Columns in df: %s", df.columns.tolist())
 
     profile = _resolve_fit_profile(fit_profile, max_nfev)
@@ -294,6 +387,7 @@ def main(
 
     ordering = data_loader.node_ordering_check(df)
     logger.info("Node ordering satisfied: %.1f %%", ordering.mean() * 100)
+    logger.info("Total DHW energy in simulation dataframe: %.2f kWh", float(df["dhw_draw_energy_kwh"].sum()))
 
     logger.info("Running identification (train_frac=%.2f) …", train_frac)
     fixed_tank_params = None
@@ -338,6 +432,7 @@ def main(
             float(val_inputs["Q_imm"][k]), float(val_inputs["T_amb"][k]),
             float(val_inputs["V_draw"][k]), float(val_inputs["T_cold"][k]),
             id_result.tank_params,
+            Q_dhw_kwh=float(val_inputs["Q_dhw"][k]),
         )
     rmse_tf = _rmse(T_tf[1:], T_val[1:])
 
@@ -353,6 +448,7 @@ def main(
         val_inputs["P_meas"],
         id_result.ashp_params,
         id_result.tank_params,
+        Q_dhw=val_inputs["Q_dhw"],
     )
     rmse_cl = _rmse(T_cl[1:-1], T_val[1:])
 
@@ -366,8 +462,8 @@ def main(
     timestamp = df.index
 
     T_sink = ashp_model.sink_proxy(
+        df["tank_bottom_c"].to_numpy(),
         df["tank_mid_c"].to_numpy(),
-        df["tank_top_c"].to_numpy(),
     )
 
     split_idx = len(df_train)
@@ -381,10 +477,13 @@ def main(
         T_sink,
         id_result.ashp_params,
     )
-    Q_fit_kw = ashp_model.predict_capacity(
-        df["t_out_c"].to_numpy(),
+    Q_fit_kwh = identification.compute_ashp_heat_kwh(
+        df["ashp_inst_kwh"].fillna(0).to_numpy(dtype=float),
+        df["t_out_c"].to_numpy(dtype=float),
         T_sink,
         id_result.ashp_params,
+        T_bottom=df["tank_bottom_c"].to_numpy(dtype=float),
+        T_top=df["tank_top_c"].to_numpy(dtype=float),
     )
 
     export_df = pd.DataFrame({
@@ -398,13 +497,76 @@ def main(
         "ashp_inst_kwh": df["ashp_inst_kwh"].to_numpy(),
         "Q_meas_backcalc_kwh": df_all["Q_ashp_backcalc_kwh"].to_numpy(),
         "P_fit_kw": P_fit_kw,
-        "Q_fit_kw": Q_fit_kw,
-        "Q_fit_kwh": Q_fit_kw * 0.5,
+        "Q_fit_kw": Q_fit_kwh / 0.5,
+        "Q_fit_kwh": Q_fit_kwh,
     })
+
+    measured = export_df["Q_meas_backcalc_kwh"].to_numpy(dtype=float)
+    simulated = export_df["Q_fit_kwh"].to_numpy(dtype=float)
+    scale_mask = np.isfinite(measured) & np.isfinite(simulated)
+    if np.any(scale_mask):
+        simulated_total = np.sum(simulated[scale_mask])
+        if simulated_total > 0:
+            scale = np.sum(measured[scale_mask]) / simulated_total
+        else:
+            scale = 1.0
+    else:
+        scale = 1.0
+    export_df["Q_fit_kwh_scaled"] = export_df["Q_fit_kwh"] * scale
 
     out_csv = output_dir / "ashp_heat_per_timestep.csv"
     export_df.to_csv(out_csv, index=False)
     logger.info("Saved ASHP heat timeseries CSV to %s", out_csv)
+
+    # ---- Export measured vs simulated tank temperatures (full dataset) ----
+    full_inputs = identification.prepare_inputs(df, id_result.ashp_params)
+    T_full_cl = identification.simulate_closed_loop(
+        full_inputs["T_meas"][0],
+        full_inputs["Q_st"],
+        full_inputs["Q_imm"],
+        full_inputs["T_amb"],
+        full_inputs["V_draw"],
+        full_inputs["T_cold"],
+        full_inputs["T_out"],
+        full_inputs["P_meas"],
+        id_result.ashp_params,
+        id_result.tank_params,
+        Q_dhw=full_inputs["Q_dhw"],
+    )[1:]
+
+    n_nodes = T_full_cl.shape[1]
+    sim_cols = [
+        "tank_bottom_sim_c",
+        "tank_mid_sim_c",
+        "tank_mid_hi_sim_c",
+        "tank_top_sim_c",
+    ]
+    if n_nodes < 4:
+        existing_nodes = sim_cols[:n_nodes]
+        raise ValueError(
+            "Tank simulation returned fewer than 4 nodes; "
+            f"available simulated nodes: {existing_nodes}"
+        )
+
+    tank_export = {
+        "timestamp": df.index,
+    }
+    measured_map = {
+        "tank_bottom_c": "tank_bottom_meas_c",
+        "tank_mid_c": "tank_mid_meas_c",
+        "tank_mid_hi_c": "tank_mid_hi_meas_c",
+        "tank_top_c": "tank_top_meas_c",
+    }
+    for src_col, out_col in measured_map.items():
+        if src_col in df.columns:
+            tank_export[out_col] = df[src_col].to_numpy(dtype=float)
+    for i, col in enumerate(sim_cols):
+        tank_export[col] = T_full_cl[:, i]
+
+    tank_export_df = pd.DataFrame(tank_export)
+    tank_csv = output_dir / "tank_temps_measured_vs_sim.csv"
+    tank_export_df.to_csv(tank_csv, index=False)
+    logger.info("Saved measured vs simulated tank temperatures to %s", tank_csv)
 
     if profile["fit_profile"] == "fast_ashp":
         train_inputs = identification.prepare_inputs(df_train, id_result.ashp_params)
@@ -419,6 +581,7 @@ def main(
             train_inputs["P_meas"],
             id_result.ashp_params,
             id_result.tank_params,
+            Q_dhw=train_inputs["Q_dhw"],
         )
         summary_fast = {
             "train": _split_summary(df_train, id_result, "train", split_inputs=train_inputs, T_pred=T_train_cl[1:]),
@@ -459,6 +622,8 @@ if __name__ == "__main__":
     parser.add_argument("--csv", type=Path, default=None)
     parser.add_argument("--yaml", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--dhw", type=Path, default=None,
+                        help="Optional DHW tank-input CSV. Defaults to the standard stochastic DHW output path if present.")
     parser.add_argument("--train-frac", type=float, default=0.7)
     parser.add_argument("--max-nfev", type=int, default=300)
     parser.add_argument("--weeks", type=int, default=None,
@@ -475,5 +640,5 @@ if __name__ == "__main__":
                              "'fast-refit' keeps a cheap tank fit on sampled seasonal blocks; "
                              "'fast_ashp' runs ASHP-only experiments on a small subset with fixed tank params.")
     args = parser.parse_args()
-    main(args.csv, args.yaml, args.output, args.train_frac, args.max_nfev,
+    main(args.csv, args.yaml, args.output, args.dhw, args.train_frac, args.max_nfev,
          args.weeks, args.start_week, args.sample_blocks, args.fit_profile)

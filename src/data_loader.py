@@ -31,6 +31,52 @@ def load_column_mapping(yaml_path: str | Path) -> dict:
         return yaml.safe_load(f) 
 
 
+def _read_csv_with_encoding_fallback(
+    csv_path: str | Path,
+    na_values: list | None = None,
+) -> pd.DataFrame:
+    """Read CSV with encoding fallback chain: UTF-8 → cp1252 → latin-1.
+    
+    Tries UTF-8 first (with BOM handling), then falls back to Windows-1252,
+    and finally to latin-1. Logs which encoding was successfully used.
+    
+    Parameters
+    ----------
+    csv_path : path to the CSV file.
+    na_values : list of strings to treat as NaN.
+    
+    Returns
+    -------
+    pd.DataFrame or raises UnicodeDecodeError if all encodings fail.
+    """
+    encodings = ["utf-8-sig", "cp1252", "latin-1"]
+    
+    for encoding in encodings:
+        try:
+            df = pd.read_csv(
+                csv_path,
+                na_values=na_values or [],
+                encoding=encoding,
+            )
+            logger.info("Successfully loaded CSV with encoding: %s", encoding)
+            return df
+        except UnicodeDecodeError:
+            if encoding == encodings[-1]:
+                # Last attempt failed; re-raise
+                raise
+            # Try next encoding
+            continue
+    
+    # Should not reach here, but just in case
+    raise UnicodeDecodeError(
+        "utf-8",
+        b"",
+        0,
+        1,
+        f"Failed to read {csv_path} with any of the attempted encodings: {encodings}",
+    )
+
+
 def load_and_clean(
     csv_path: str | Path,
     yaml_path: str | Path,
@@ -53,10 +99,9 @@ def load_and_clean(
     cfg = load_column_mapping(yaml_path)
 
     # ---- 1. Read CSV, treating #N/A as NaN --------------------------------
-    df = pd.read_csv(
+    df = _read_csv_with_encoding_fallback(
         csv_path,
         na_values=["#N/A", "#N/A!", "#REF!", "N/A", ""],
-        encoding="utf-8-sig",          # handles BOM (quirk of Excel exports)
     )
     logger.info("Raw CSV shape: %s", df.shape) #records the shape of the raw CSV for debugging purposes
 
